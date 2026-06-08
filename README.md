@@ -50,6 +50,12 @@ For `F:\Audio\lecture.mp3`, the default result is:
 F:\Audio\lecture.srt
 ```
 
+The SRT file is created when transcription starts and is appended after each
+recognized segment. You can open it during a long run to inspect the partial
+transcript. When Whisper finishes successfully, the partial file is replaced
+with Whisper's finalized SRT. If processing fails or is interrupted, the
+partial SRT remains available.
+
 The SRT file includes timestamps and can be searched for phrases such as
 `elhárító mechanizmusok`.
 

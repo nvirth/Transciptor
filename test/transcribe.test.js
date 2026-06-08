@@ -5,6 +5,9 @@ const assert = require("node:assert/strict");
 
 const {
   buildWhisperArgs,
+  createSrtStreamParser,
+  formatSrtCue,
+  normalizeSrtTimestamp,
   parseArgs,
   quoteForDisplay,
 } = require("../transcribe");
@@ -63,6 +66,7 @@ test("buildWhisperArgs creates the expected Python module arguments", () => {
   );
 
   assert.deepEqual(args, [
+    "-u",
     "-m",
     "whisper",
     "C:\\Audio Files\\lecture.mp3",
@@ -76,6 +80,8 @@ test("buildWhisperArgs creates the expected Python module arguments", () => {
     "C:\\Audio Files",
     "--task",
     "transcribe",
+    "--verbose",
+    "True",
   ]);
 });
 
@@ -85,4 +91,30 @@ test("quoteForDisplay quotes paths containing spaces", () => {
     '"C:\\Audio Files\\lecture.mp3"',
   );
   assert.equal(quoteForDisplay("small"), "small");
+});
+
+test("normalizeSrtTimestamp adds hours and uses a comma", () => {
+  assert.equal(normalizeSrtTimestamp("02:03.456"), "00:02:03,456");
+  assert.equal(normalizeSrtTimestamp("01:02:03.456"), "01:02:03,456");
+});
+
+test("formatSrtCue creates a valid SRT block", () => {
+  assert.equal(
+    formatSrtCue(4, "02:03.456", "02:07.890", "  Hello world  "),
+    "4\n00:02:03,456 --> 00:02:07,890\nHello world\n\n",
+  );
+});
+
+test("SRT stream parser handles split chunks and ignores other output", () => {
+  const cues = [];
+  const parser = createSrtStreamParser((cue) => cues.push(cue));
+
+  parser.push("Loading model...\r\n[00:00.000 --> 00:02.");
+  parser.push("500] First sentence.\r\n[01:02:03.004 --> 01:02:05.006] ");
+  parser.end("Second sentence.\r\n");
+
+  assert.deepEqual(cues, [
+    "1\n00:00:00,000 --> 00:00:02,500\nFirst sentence.\n\n",
+    "2\n01:02:03,004 --> 01:02:05,006\nSecond sentence.\n\n",
+  ]);
 });
