@@ -1,0 +1,20 @@
+node_modules/
+
+# Audio/video inputs and generated transcripts
+*.aac
+*.avi
+*.flac
+*.m4a
+*.mkv
+*.mov
+*.mp3
+*.mp4
+*.ogg
+*.srt
+*.tsv
+*.vtt
+*.wav
+*.webm
+
+# Optional dedicated output folder
+transcripts/

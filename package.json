@@ -1,0 +1,12 @@
+{
+  "name": "transciptor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Windows-friendly local OpenAI Whisper transcription wrapper",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
