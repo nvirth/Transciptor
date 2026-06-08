@@ -44,6 +44,25 @@ Drag an audio file onto `transcribe.bat`, or run:
 .\transcribe.bat "F:\Audio\lecture.mp3"
 ```
 
+You can pass multiple file arguments:
+
+```powershell
+.\transcribe.bat "part 1.mp3" "part 2.mp3" "part 3.mp3"
+```
+
+JSON-array syntax is also accepted:
+
+```powershell
+.\transcribe.bat '["part 1.mp3","part 2.mp3"]'
+```
+
+Files run sequentially by default. Use `--parallel` (or `-j`) to set the
+maximum number of simultaneous Whisper processes:
+
+```powershell
+.\transcribe.bat "part 1.mp3" "part 2.mp3" --parallel 2
+```
+
 For `F:\Audio\lecture.mp3`, the default result is:
 
 ```text
@@ -66,6 +85,7 @@ The SRT file includes timestamps and can be searched for phrases such as
 -m, --model <name>       Whisper model (default: small)
 -f, --format <format>    txt, vtt, srt, tsv, json, or all
 -o, --output-dir <path>  Output folder
+-j, --parallel <count>   Maximum simultaneous files (default: 1)
     --task <task>        transcribe or translate
     --install            Install/update Whisper and FFmpeg
     --dry-run            Print the command without running it
@@ -92,6 +112,9 @@ open a new one, and run the transcription command again.
 
 Long recordings can take a while on a CPU. Use `--model base` for a faster,
 less accurate first pass.
+
+Parallel processing uses more CPU, RAM, and GPU memory. If jobs fail because
+memory is exhausted, reduce `--parallel`.
 
 Run the automated tests with:
 

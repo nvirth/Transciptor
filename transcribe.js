@@ -25,11 +25,30 @@ const VALUE_OPTIONS = new Map([
   ["--output-dir", "outputDir"],
   ["-o", "outputDir"],
   ["--task", "task"],
+  ["--parallel", "parallel"],
+  ["--parallel-count", "parallel"],
+  ["-j", "parallel"],
 ]);
 
 const VALID_FORMATS = new Set(["txt", "vtt", "srt", "tsv", "json", "all"]);
 const VALID_TASKS = new Set(["transcribe", "translate"]);
 const ALL_OUTPUT_FORMATS = ["txt", "vtt", "srt", "tsv", "json"];
+
+function parseFileArrayArgument(rawArg) {
+  try {
+    const parsed = JSON.parse(rawArg);
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+    // Windows shells may remove the quotes inside a JSON-like array.
+  }
+
+  return rawArg
+    .slice(1, -1)
+    .split(",")
+    .map((value) => value.trim().replace(/^(["'])(.*)\1$/, "$2"));
+}
 
 function parseArgs(argv) {
   const options = {
@@ -38,7 +57,8 @@ function parseArgs(argv) {
     install: false,
     dryRun: false,
     help: false,
-    input: null,
+    parallel: 1,
+    inputs: [],
   };
 
   let positionalOnly = false;
@@ -100,10 +120,22 @@ function parseArgs(argv) {
       continue;
     }
 
-    if (options.input) {
-      throw new Error("Only one input audio file can be transcribed at a time.");
+    if (rawArg.startsWith("[") && rawArg.endsWith("]")) {
+      const parsed = parseFileArrayArgument(rawArg);
+
+      if (
+        !Array.isArray(parsed) ||
+        parsed.length === 0 ||
+        parsed.some((value) => typeof value !== "string" || !value)
+      ) {
+        throw new Error("The file array must contain one or more file names.");
+      }
+
+      options.inputs.push(...parsed);
+      continue;
     }
-    options.input = rawArg;
+
+    options.inputs.push(rawArg);
   }
 
   if (!VALID_FORMATS.has(options.format)) {
@@ -115,6 +147,12 @@ function parseArgs(argv) {
   if (!VALID_TASKS.has(options.task)) {
     throw new Error(`Unsupported task "${options.task}". Use: transcribe or translate.`);
   }
+
+  const parallel = Number(options.parallel);
+  if (!Number.isInteger(parallel) || parallel < 1) {
+    throw new Error('Parallel count must be a positive integer, for example "--parallel 2".');
+  }
+  options.parallel = parallel;
 
   return options;
 }
@@ -308,6 +346,50 @@ function runWhisperStreaming(command, args, liveSrtPath) {
   });
 }
 
+function runAsyncInherited(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: "inherit",
+      windowsHide: false,
+    });
+
+    child.on("error", (error) => {
+      reject(new Error(`Could not start ${command}: ${error.message}`));
+    });
+    child.on("close", (status) => {
+      resolve(status ?? 1);
+    });
+  });
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runNext() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      try {
+        results[currentIndex] = {
+          status: "fulfilled",
+          value: await worker(items[currentIndex], currentIndex),
+        };
+      } catch (error) {
+        results[currentIndex] = {
+          status: "rejected",
+          reason: error,
+        };
+      }
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, runNext));
+  return results;
+}
+
 function outputPath(outputDir, inputPath, extension) {
   return path.join(outputDir, `${path.parse(inputPath).name}.${extension}`);
 }
@@ -379,8 +461,9 @@ function printHelp() {
 Transciptor - create timestamped transcripts with local OpenAI Whisper
 
 Usage:
-  node transcribe.js <audio-file> [options]
-  transcribe.bat <audio-file> [options]
+  node transcribe.js <audio-file...> [options]
+  transcribe.bat <audio-file...> [options]
+  transcribe.bat '["file1.mp3","file2.mp3"]' [options]
   transcribe.bat --install
 
 Options:
@@ -388,6 +471,7 @@ Options:
   -m, --model <name>       Whisper model (default: small)
   -f, --format <format>    txt, vtt, srt, tsv, json, or all (default: srt)
   -o, --output-dir <path>  Output folder (default: next to the audio file)
+  -j, --parallel <count>   Maximum simultaneous files (default: 1)
       --task <task>        transcribe or translate (default: transcribe)
       --install            Install/update Whisper and install FFmpeg if needed
       --dry-run            Print the Whisper command without running it
@@ -395,9 +479,116 @@ Options:
 
 Examples:
   transcribe.bat "C:\\Audio\\lecture.mp3"
+  transcribe.bat "part 1.mp3" "part 2.mp3" --parallel 2
   transcribe.bat "lecture.mp3" --model base --format srt
   transcribe.bat "lecture.mp3" -l English -o "C:\\Transcripts"
 `.trim());
+}
+
+function resolveInputPaths(inputs) {
+  return inputs.map((input) => {
+    const inputPath = path.resolve(input);
+    if (!fs.existsSync(inputPath) || !fs.statSync(inputPath).isFile()) {
+      throw new Error(`Input file does not exist: ${inputPath}`);
+    }
+    return inputPath;
+  });
+}
+
+function validateOutputPaths(options, inputPaths) {
+  const claimedPaths = new Map();
+  const formats = options.format === "all"
+    ? ALL_OUTPUT_FORMATS
+    : [options.format];
+
+  for (const inputPath of inputPaths) {
+    const outputDir = options.outputDir
+      ? path.resolve(options.outputDir)
+      : path.dirname(inputPath);
+
+    for (const extension of formats) {
+      const destination = outputPath(outputDir, inputPath, extension);
+      const normalized = path.normalize(destination).toLowerCase();
+      const previousInput = claimedPaths.get(normalized);
+
+      if (previousInput) {
+        throw new Error(
+          `Output collision: "${previousInput}" and "${inputPath}" would both write "${destination}".`,
+        );
+      }
+      claimedPaths.set(normalized, inputPath);
+    }
+  }
+}
+
+async function transcribeFile(options, python, inputPath, position, total) {
+  const outputDir = options.outputDir
+    ? path.resolve(options.outputDir)
+    : path.dirname(inputPath);
+  const whisperArgs = [
+    ...python.prefix,
+    ...buildWhisperArgs(options, inputPath, outputDir),
+  ];
+  const label = `[${position + 1}/${total}]`;
+
+  if (options.dryRun) {
+    process.stdout.write(`${label} `);
+    printCommand(python.command, whisperArgs);
+    return;
+  }
+
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  console.log(`${label} Starting: ${inputPath}`);
+  console.log(`${label} Output:   ${outputDir}`);
+
+  const writesSrt = options.format === "srt" || options.format === "all";
+  let tempOutputDir = null;
+
+  try {
+    if (writesSrt) {
+      const liveSrtPath = outputPath(outputDir, inputPath, "srt");
+      tempOutputDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "transciptor-"),
+      );
+      const streamingArgs = [
+        ...python.prefix,
+        ...buildWhisperArgs(options, inputPath, tempOutputDir),
+      ];
+
+      fs.writeFileSync(liveSrtPath, "", "utf8");
+      console.log(`${label} Live SRT: ${liveSrtPath}`);
+
+      const status = await runWhisperStreaming(
+        python.command,
+        streamingArgs,
+        liveSrtPath,
+      );
+      if (status !== 0) {
+        throw new Error(
+          `Whisper exited with code ${status}. Partial SRT kept at: ${liveSrtPath}`,
+        );
+      }
+
+      promoteWhisperOutputs(
+        tempOutputDir,
+        outputDir,
+        inputPath,
+        options.format,
+      );
+    } else {
+      const status = await runAsyncInherited(python.command, whisperArgs);
+      if (status !== 0) {
+        throw new Error(`Whisper exited with code ${status}.`);
+      }
+    }
+  } finally {
+    if (tempOutputDir) {
+      fs.rmSync(tempOutputDir, { recursive: true, force: true });
+    }
+  }
+
+  console.log(`${label} Completed: ${inputPath}`);
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -427,104 +618,58 @@ async function main(argv = process.argv.slice(2)) {
   try {
     if (options.install) {
       installDependencies(python);
-      if (!options.input) {
+      if (options.inputs.length === 0) {
         console.log("Dependencies are ready.");
         return 0;
       }
     }
 
-    if (!options.input) {
+    if (options.inputs.length === 0) {
       printHelp();
       return 2;
     }
 
-    const inputPath = path.resolve(options.input);
-    if (!fs.existsSync(inputPath) || !fs.statSync(inputPath).isFile()) {
-      throw new Error(`Input file does not exist: ${inputPath}`);
-    }
+    const inputPaths = resolveInputPaths(options.inputs);
+    validateOutputPaths(options, inputPaths);
 
-    const outputDir = options.outputDir
-      ? path.resolve(options.outputDir)
-      : path.dirname(inputPath);
-    const whisperArgs = [
-      ...python.prefix,
-      ...buildWhisperArgs(options, inputPath, outputDir),
-    ];
-
-    if (options.dryRun) {
-      printCommand(python.command, whisperArgs);
-      return 0;
-    }
-
-    if (!hasWhisper(python)) {
+    if (!options.dryRun && !hasWhisper(python)) {
       throw new Error(
         "OpenAI Whisper is not installed. Run transcribe.bat --install first.",
       );
     }
 
-    if (!hasFfmpeg()) {
+    if (!options.dryRun && !hasFfmpeg()) {
       throw new Error(
         "FFmpeg is not installed or not on PATH. Run transcribe.bat --install first.",
       );
     }
 
-    fs.mkdirSync(outputDir, { recursive: true });
-
-    console.log(`Input:  ${inputPath}`);
-    console.log(`Output: ${outputDir}`);
-    console.log(`Model:  ${options.model}`);
+    console.log(`Files: ${inputPaths.length}`);
+    console.log(`Parallel processes: ${options.parallel}`);
+    console.log(`Model: ${options.model}`);
     console.log(`Language: ${options.language}`);
     console.log("");
 
-    const writesSrt = options.format === "srt" || options.format === "all";
-    let tempOutputDir = null;
+    const results = await runWithConcurrency(
+      inputPaths,
+      options.parallel,
+      (inputPath, index) =>
+        transcribeFile(options, python, inputPath, index, inputPaths.length),
+    );
+    const failures = results
+      .map((result, index) => ({ result, inputPath: inputPaths[index] }))
+      .filter(({ result }) => result.status === "rejected");
 
-    try {
-      if (writesSrt) {
-        const liveSrtPath = outputPath(outputDir, inputPath, "srt");
-        tempOutputDir = fs.mkdtempSync(
-          path.join(os.tmpdir(), "transciptor-"),
-        );
-        const streamingArgs = [
-          ...python.prefix,
-          ...buildWhisperArgs(options, inputPath, tempOutputDir),
-        ];
-
-        fs.writeFileSync(liveSrtPath, "", "utf8");
-        console.log(`Live SRT: ${liveSrtPath}`);
-        console.log("");
-
-        const status = await runWhisperStreaming(
-          python.command,
-          streamingArgs,
-          liveSrtPath,
-        );
-        if (status !== 0) {
-          throw new Error(
-            `Whisper exited with code ${status}. Partial SRT kept at: ${liveSrtPath}`,
-          );
-        }
-
-        promoteWhisperOutputs(
-          tempOutputDir,
-          outputDir,
-          inputPath,
-          options.format,
-        );
-      } else {
-        const status = runInherited(python.command, whisperArgs);
-        if (status !== 0) {
-          throw new Error(`Whisper exited with code ${status}.`);
-        }
-      }
-    } finally {
-      if (tempOutputDir) {
-        fs.rmSync(tempOutputDir, { recursive: true, force: true });
-      }
+    for (const { result, inputPath } of failures) {
+      console.error(`Failed: ${inputPath}`);
+      console.error(`  ${result.reason.message}`);
     }
 
-    console.log(`\nTranscript created in: ${outputDir}`);
-    return 0;
+    const summaryVerb = options.dryRun ? "Prepared" : "Completed";
+    console.log(
+      `\n${summaryVerb} ${inputPaths.length - failures.length}/${inputPaths.length} file(s).`,
+    );
+    return failures.length === 0 ? 0 : 1;
   } catch (error) {
     console.error(`Error: ${error.message}`);
     return 1;
@@ -549,4 +694,5 @@ module.exports = {
   normalizeSrtTimestamp,
   parseArgs,
   quoteForDisplay,
+  runWithConcurrency,
 };
