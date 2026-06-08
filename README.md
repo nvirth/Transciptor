@@ -75,6 +75,14 @@ transcript. When Whisper finishes successfully, the partial file is replaced
 with Whisper's finalized SRT. If processing fails or is interrupted, the
 partial SRT remains available.
 
+If an SRT with the expected output name already exists, Transciptor reads its
+last valid subtitle and resumes the audio from that subtitle's end timestamp.
+Valid existing cues are preserved and numbering continues from the next cue.
+An unfinished trailing cue is discarded automatically. Delete or rename the
+existing SRT when you intentionally want to restart from the beginning.
+Automatic resume applies to `--format srt`; it is not used with
+`--format all`.
+
 The SRT file includes timestamps and can be searched for phrases such as
 `elhárító mechanizmusok`.
 

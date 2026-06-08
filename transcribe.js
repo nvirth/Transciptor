@@ -157,8 +157,8 @@ function parseArgs(argv) {
   return options;
 }
 
-function buildWhisperArgs(options, inputPath, outputDir) {
-  return [
+function buildWhisperArgs(options, inputPath, outputDir, resumeSeconds = 0) {
+  const args = [
     "-u",
     "-m",
     "whisper",
@@ -176,6 +176,12 @@ function buildWhisperArgs(options, inputPath, outputDir) {
     "--verbose",
     "True",
   ];
+
+  if (resumeSeconds > 0) {
+    args.push("--clip_timestamps", resumeSeconds.toFixed(3));
+  }
+
+  return args;
 }
 
 function normalizeSrtTimestamp(timestamp) {
@@ -195,9 +201,105 @@ function formatSrtCue(index, start, end, text) {
   ].join("\n");
 }
 
-function createSrtStreamParser(onCue) {
+function parseSrtTimestamp(timestamp) {
+  const match = /^(\d+):(\d{2}):(\d{2})[,.](\d{3})$/.exec(timestamp.trim());
+  if (!match) {
+    throw new Error(`Invalid SRT timestamp: ${timestamp}`);
+  }
+
+  return (
+    Number(match[1]) * 3600 +
+    Number(match[2]) * 60 +
+    Number(match[3]) +
+    Number(match[4]) / 1000
+  );
+}
+
+function formatSecondsAsSrt(seconds) {
+  const totalMilliseconds = Math.max(0, Math.round(seconds * 1000));
+  const hours = Math.floor(totalMilliseconds / 3_600_000);
+  const afterHours = totalMilliseconds - hours * 3_600_000;
+  const minutes = Math.floor(afterHours / 60_000);
+  const afterMinutes = afterHours - minutes * 60_000;
+  const wholeSeconds = Math.floor(afterMinutes / 1000);
+  const milliseconds = afterMinutes - wholeSeconds * 1000;
+
+  return [
+    String(hours).padStart(2, "0"),
+    String(minutes).padStart(2, "0"),
+    `${String(wholeSeconds).padStart(2, "0")},${String(milliseconds).padStart(3, "0")}`,
+  ].join(":");
+}
+
+function formatSrtCueFromSeconds(index, start, end, text) {
+  return [
+    index,
+    `${formatSecondsAsSrt(start)} --> ${formatSecondsAsSrt(end)}`,
+    text.trim(),
+    "",
+    "",
+  ].join("\n");
+}
+
+function parseSrtCues(content) {
+  const normalized = content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+  const blocks = normalized.split(/\n{2,}/);
+  const cues = [];
+
+  for (const block of blocks) {
+    const trimmed = block.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const lines = trimmed.split("\n");
+    if (!/^\d+$/.test(lines[0] ?? "")) {
+      break;
+    }
+
+    const timing = /^(\d+:\d{2}:\d{2}[,.]\d{3})\s+-->\s+(\d+:\d{2}:\d{2}[,.]\d{3})/.exec(
+      lines[1] ?? "",
+    );
+    const text = lines.slice(2).join("\n").trim();
+    if (!timing || !text) {
+      break;
+    }
+
+    const start = parseSrtTimestamp(timing[1]);
+    const end = parseSrtTimestamp(timing[2]);
+    if (end < start || (cues.length > 0 && end <= cues.at(-1).end)) {
+      break;
+    }
+
+    cues.push({ start, end, text });
+  }
+
+  return cues;
+}
+
+function serializeSrtCues(cues) {
+  return cues
+    .map((cue, index) =>
+      formatSrtCueFromSeconds(index + 1, cue.start, cue.end, cue.text),
+    )
+    .join("");
+}
+
+function readResumeState(srtPath) {
+  if (!fs.existsSync(srtPath)) {
+    return { cues: [], resumeSeconds: 0 };
+  }
+
+  const cues = parseSrtCues(fs.readFileSync(srtPath, "utf8"));
+  return {
+    cues,
+    resumeSeconds: cues.length > 0 ? cues.at(-1).end : 0,
+  };
+}
+
+function createSrtStreamParser(onCue, startIndex = 0) {
   let buffer = "";
-  let cueIndex = 0;
+  let cueIndex = startIndex;
   const timestamp = "(?:\\d{2}:)?\\d{2}:\\d{2}\\.\\d{3}";
   const segmentPattern = new RegExp(
     `^\\[(${timestamp}) --> (${timestamp})\\]\\s*(.*)$`,
@@ -290,12 +392,12 @@ function runInherited(command, args) {
   return result.status ?? 1;
 }
 
-function runWhisperStreaming(command, args, liveSrtPath) {
+function runWhisperStreaming(command, args, liveSrtPath, startIndex = 0) {
   return new Promise((resolve, reject) => {
     const decoder = new StringDecoder("utf8");
     const parser = createSrtStreamParser((cue) => {
       fs.appendFileSync(liveSrtPath, cue, "utf8");
-    });
+    }, startIndex);
     const child = spawn(command, args, {
       stdio: ["inherit", "pipe", "pipe"],
       windowsHide: false,
@@ -394,7 +496,13 @@ function outputPath(outputDir, inputPath, extension) {
   return path.join(outputDir, `${path.parse(inputPath).name}.${extension}`);
 }
 
-function promoteWhisperOutputs(tempDir, outputDir, inputPath, format) {
+function promoteWhisperOutputs(
+  tempDir,
+  outputDir,
+  inputPath,
+  format,
+  existingCues = [],
+) {
   const formats = format === "all" ? ALL_OUTPUT_FORMATS : [format];
 
   for (const extension of formats) {
@@ -405,7 +513,22 @@ function promoteWhisperOutputs(tempDir, outputDir, inputPath, format) {
       throw new Error(`Whisper did not create the expected file: ${source}`);
     }
 
-    fs.copyFileSync(source, destination);
+    if (extension === "srt") {
+      const resumedCues = parseSrtCues(fs.readFileSync(source, "utf8"));
+      const resumeSeconds = existingCues.length > 0
+        ? existingCues.at(-1).end
+        : 0;
+      const newCues = resumedCues.filter(
+        (cue) => cue.end > resumeSeconds + 0.001,
+      );
+      fs.writeFileSync(
+        destination,
+        serializeSrtCues([...existingCues, ...newCues]),
+        "utf8",
+      );
+    } else {
+      fs.copyFileSync(source, destination);
+    }
   }
 }
 
@@ -525,9 +648,26 @@ async function transcribeFile(options, python, inputPath, position, total) {
   const outputDir = options.outputDir
     ? path.resolve(options.outputDir)
     : path.dirname(inputPath);
+  const writesSrt = options.format === "srt" || options.format === "all";
+  const liveSrtPath = writesSrt
+    ? outputPath(outputDir, inputPath, "srt")
+    : null;
+  const resumeState = liveSrtPath
+    ? readResumeState(liveSrtPath)
+    : { cues: [], resumeSeconds: 0 };
+  if (resumeState.resumeSeconds > 0 && options.format === "all") {
+    throw new Error(
+      'Resuming an existing transcript supports "--format srt" only. Use --format srt, or delete the existing SRT to rebuild all formats.',
+    );
+  }
   const whisperArgs = [
     ...python.prefix,
-    ...buildWhisperArgs(options, inputPath, outputDir),
+    ...buildWhisperArgs(
+      options,
+      inputPath,
+      outputDir,
+      resumeState.resumeSeconds,
+    ),
   ];
   const label = `[${position + 1}/${total}]`;
 
@@ -542,27 +682,40 @@ async function transcribeFile(options, python, inputPath, position, total) {
   console.log(`${label} Starting: ${inputPath}`);
   console.log(`${label} Output:   ${outputDir}`);
 
-  const writesSrt = options.format === "srt" || options.format === "all";
   let tempOutputDir = null;
 
   try {
     if (writesSrt) {
-      const liveSrtPath = outputPath(outputDir, inputPath, "srt");
       tempOutputDir = fs.mkdtempSync(
         path.join(os.tmpdir(), "transciptor-"),
       );
       const streamingArgs = [
         ...python.prefix,
-        ...buildWhisperArgs(options, inputPath, tempOutputDir),
+        ...buildWhisperArgs(
+          options,
+          inputPath,
+          tempOutputDir,
+          resumeState.resumeSeconds,
+        ),
       ];
 
-      fs.writeFileSync(liveSrtPath, "", "utf8");
+      fs.writeFileSync(
+        liveSrtPath,
+        serializeSrtCues(resumeState.cues),
+        "utf8",
+      );
       console.log(`${label} Live SRT: ${liveSrtPath}`);
+      if (resumeState.resumeSeconds > 0) {
+        console.log(
+          `${label} Resuming after ${formatSecondsAsSrt(resumeState.resumeSeconds)}`,
+        );
+      }
 
       const status = await runWhisperStreaming(
         python.command,
         streamingArgs,
         liveSrtPath,
+        resumeState.cues.length,
       );
       if (status !== 0) {
         throw new Error(
@@ -575,6 +728,7 @@ async function transcribeFile(options, python, inputPath, position, total) {
         outputDir,
         inputPath,
         options.format,
+        resumeState.cues,
       );
     } else {
       const status = await runAsyncInherited(python.command, whisperArgs);
@@ -689,10 +843,15 @@ module.exports = {
   DEFAULTS,
   buildWhisperArgs,
   createSrtStreamParser,
+  formatSecondsAsSrt,
   formatSrtCue,
   main,
   normalizeSrtTimestamp,
   parseArgs,
+  parseSrtCues,
+  parseSrtTimestamp,
   quoteForDisplay,
+  readResumeState,
   runWithConcurrency,
+  serializeSrtCues,
 };

@@ -6,11 +6,15 @@ const assert = require("node:assert/strict");
 const {
   buildWhisperArgs,
   createSrtStreamParser,
+  formatSecondsAsSrt,
   formatSrtCue,
   normalizeSrtTimestamp,
   parseArgs,
+  parseSrtCues,
+  parseSrtTimestamp,
   quoteForDisplay,
   runWithConcurrency,
+  serializeSrtCues,
 } = require("../transcribe");
 
 test("parseArgs uses Hungarian, small, and SRT defaults", () => {
@@ -109,6 +113,18 @@ test("buildWhisperArgs creates the expected Python module arguments", () => {
   ]);
 });
 
+test("buildWhisperArgs starts a resumed transcription at the requested time", () => {
+  const options = parseArgs(["lecture.mp3"]);
+  const args = buildWhisperArgs(
+    options,
+    "C:\\Audio Files\\lecture.mp3",
+    "C:\\Audio Files",
+    123.456,
+  );
+
+  assert.deepEqual(args.slice(-2), ["--clip_timestamps", "123.456"]);
+});
+
 test("quoteForDisplay quotes paths containing spaces", () => {
   assert.equal(
     quoteForDisplay("C:\\Audio Files\\lecture.mp3"),
@@ -120,6 +136,11 @@ test("quoteForDisplay quotes paths containing spaces", () => {
 test("normalizeSrtTimestamp adds hours and uses a comma", () => {
   assert.equal(normalizeSrtTimestamp("02:03.456"), "00:02:03,456");
   assert.equal(normalizeSrtTimestamp("01:02:03.456"), "01:02:03,456");
+});
+
+test("SRT timestamps convert between text and seconds", () => {
+  assert.equal(parseSrtTimestamp("01:02:03,456"), 3723.456);
+  assert.equal(formatSecondsAsSrt(3723.456), "01:02:03,456");
 });
 
 test("formatSrtCue creates a valid SRT block", () => {
@@ -141,6 +162,54 @@ test("SRT stream parser handles split chunks and ignores other output", () => {
     "1\n00:00:00,000 --> 00:00:02,500\nFirst sentence.\n\n",
     "2\n01:02:03,004 --> 01:02:05,006\nSecond sentence.\n\n",
   ]);
+});
+
+test("SRT stream parser continues cue numbering when resuming", () => {
+  const cues = [];
+  const parser = createSrtStreamParser((cue) => cues.push(cue), 7);
+
+  parser.end("[00:10.000 --> 00:12.000] Continued text.\n");
+
+  assert.equal(
+    cues[0],
+    "8\n00:00:10,000 --> 00:00:12,000\nContinued text.\n\n",
+  );
+});
+
+test("parseSrtCues keeps the valid prefix and ignores an unfinished cue", () => {
+  const cues = parseSrtCues([
+    "1",
+    "00:00:00,000 --> 00:00:02,500",
+    "First sentence.",
+    "",
+    "2",
+    "00:00:02,500 --> 00:00:05,000",
+    "Second",
+    "line.",
+    "",
+    "3",
+    "00:00:05,000 -->",
+  ].join("\n"));
+
+  assert.deepEqual(cues, [
+    { start: 0, end: 2.5, text: "First sentence." },
+    { start: 2.5, end: 5, text: "Second\nline." },
+  ]);
+  assert.equal(
+    serializeSrtCues(cues),
+    [
+      "1",
+      "00:00:00,000 --> 00:00:02,500",
+      "First sentence.",
+      "",
+      "2",
+      "00:00:02,500 --> 00:00:05,000",
+      "Second",
+      "line.",
+      "",
+      "",
+    ].join("\n"),
+  );
 });
 
 test("runWithConcurrency never exceeds the requested worker count", async () => {
